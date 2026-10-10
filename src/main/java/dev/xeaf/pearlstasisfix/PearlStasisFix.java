@@ -1,13 +1,15 @@
 package dev.xeaf.pearlstasisfix;
 
 import org.bukkit.Bukkit;
-import org.bukkit.Chunk;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
+import org.bukkit.block.data.type.BubbleColumn;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.EnderPearl;
@@ -30,8 +32,17 @@ import org.bukkit.util.BoundingBox;
 import org.bukkit.util.Vector;
 
 import java.io.File;
+import java.io.FileReader;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -53,6 +64,46 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
     private File dataFile;
     private FileConfiguration dataConfig;
 
+    // ------------------------------------------------------------------
+    // Chunk loading around stasis chambers (config.yml -> chunk-radius)
+    // ------------------------------------------------------------------
+
+    // Hard upper bound for chunk-radius. A radius of r means (2r+1)^2 chunk tickets per
+    // stasis, so this exists mainly to stop a typo (e.g. 80 instead of 8) from asking the
+    // server to keep thousands of chunks loaded.
+    private static final int MAX_CHUNK_RADIUS = 8;
+
+    private int chunkRadius = 1;
+
+    // ------------------------------------------------------------------
+    // Stasis detection settings (config.yml -> detection.*)
+    // ------------------------------------------------------------------
+
+    // How far above the floor of its water block the parked pearl sits (config.yml ->
+    // dummy-height). The water surface is at ~0.89, so values just under that put the
+    // pearl right on the waterline.
+    private double dummyHeight = 0.87;
+
+    private boolean detectBubbleColumns = true;
+    private int minTicksBubbleColumn = 2;
+
+    // Blocks a pearl has to be TOUCHING (not just inside) to count: honey blocks plus
+    // whatever the admin listed under detection.extra-blocks.
+    private final Set<Material> touchMediums = EnumSet.noneOf(Material.class);
+    private int minTicksTouchMedium = 10;
+
+    // Paper allows a plugin only ONE ticket per chunk, so two stasis chambers whose areas
+    // overlap can't each hold their own ticket for the shared chunks - releasing one would
+    // silently drop the other's. We therefore count how many stasis areas want each chunk
+    // and only add/remove the real ticket on the 0->1 / 1->0 transitions.
+    private final Object ticketLock = new Object();
+    private final Map<ChunkPos, Integer> ticketRefs = new HashMap<>();
+    private final Map<UUID, TicketArea> ticketAreas = new HashMap<>();
+
+    private record ChunkPos(UUID world, int x, int z) {}
+
+    private record TicketArea(UUID world, int centerX, int centerZ, int radius) {}
+
     @Override
     public void onEnable() {
         markerKey = new NamespacedKey(this, "stasis-marker");
@@ -60,15 +111,183 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
 
         getServer().getPluginManager().registerEvents(this, this);
 
+        saveDefaultConfig();
+        addMissingConfigDefaults();
+        loadSettings();
+        warnIfServerPausesWhenEmpty();
+
         loadDataFile();
         reattachAllPersistedStasis();
 
-        getLogger().info("PearlStasisFix enabled!");
+        getLogger().info("PearlStasisFix v" + getDescription().getVersion() + " enabled (dummy-height "
+                + dummyHeight + ").");
     }
 
     @Override
     public void onDisable() {
+        releaseAllTicketAreas();
         saveDataFile();
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (args.length == 1 && args[0].equalsIgnoreCase("reload")) {
+            reloadConfig();
+            loadSettings();
+            sender.sendMessage("PearlStasisFix config reloaded (dummy-height " + dummyHeight
+                    + "). Existing pearls keep the height they were created at; "
+                    + "chunk-radius only applies to stasis chambers created from now on.");
+            return true;
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Settings
+    // ------------------------------------------------------------------
+
+    /**
+     * saveDefaultConfig() only writes config.yml when it doesn't exist, so after an update
+     * the file on disk would silently lack any newly added options. Copy in whatever is
+     * missing (existing values are never overwritten).
+     */
+    private void addMissingConfigDefaults() {
+        FileConfiguration config = getConfig();
+        if (config.getDefaults() == null) return;
+        if (config.getKeys(true).containsAll(config.getDefaults().getKeys(true))) return;
+        config.options().copyDefaults(true);
+        saveConfig();
+        getLogger().info("Added new options to config.yml.");
+    }
+
+    private void loadSettings() {
+        int configured = getConfig().getInt("chunk-radius", 1);
+        chunkRadius = Math.max(0, Math.min(configured, MAX_CHUNK_RADIUS));
+        if (configured != chunkRadius) {
+            getLogger().warning("chunk-radius " + configured + " is out of range, using " + chunkRadius
+                    + " instead (allowed: 0-" + MAX_CHUNK_RADIUS + ").");
+        }
+        int side = chunkRadius * 2 + 1;
+        getLogger().info("Chunk radius around each stasis: " + chunkRadius + " (" + side + "x" + side + " chunks).");
+
+        dummyHeight = Math.max(0.0, Math.min(0.99, getConfig().getDouble("dummy-height", 0.87)));
+        detectBubbleColumns = getConfig().getBoolean("detection.bubble-columns", true);
+        minTicksBubbleColumn = Math.max(1, getConfig().getInt("detection.min-ticks-bubble-column", 2));
+        minTicksTouchMedium = Math.max(1, getConfig().getInt("detection.min-ticks-touch-medium", 10));
+
+        touchMediums.clear();
+        if (getConfig().getBoolean("detection.honey-blocks", true)) {
+            touchMediums.add(Material.HONEY_BLOCK);
+        }
+        List<String> extras = getConfig().getStringList("detection.extra-blocks");
+        for (String name : extras) {
+            Material material = Material.matchMaterial(name.trim().toUpperCase(Locale.ROOT));
+            if (material == null || !material.isBlock()) {
+                getLogger().warning("detection.extra-blocks: \"" + name + "\" is not a valid block type, ignoring it.");
+                continue;
+            }
+            touchMediums.add(material);
+        }
+        getLogger().info("Stasis detection: bubble columns " + (detectBubbleColumns ? "on" : "off")
+                + ", touch mediums " + touchMediums + ".");
+    }
+
+    /**
+     * Since Minecraft 1.21.2 the vanilla server stops ticking entirely once nobody has been
+     * online for pause-when-empty-seconds (vanilla default 60; Paper defaults to -1 = never).
+     * A paused server ticks nothing - including chunks we keep loaded - so warn if it's on.
+     */
+    private void warnIfServerPausesWhenEmpty() {
+        File props = new File("server.properties");
+        if (!props.isFile()) return;
+        try (FileReader reader = new FileReader(props, StandardCharsets.UTF_8)) {
+            Properties p = new Properties();
+            p.load(reader);
+            String value = p.getProperty("pause-when-empty-seconds");
+            if (value != null && Integer.parseInt(value.trim()) > 0) {
+                getLogger().warning("server.properties has pause-when-empty-seconds=" + value.trim()
+                        + ". With nobody online the server will pause and stasis chunks will NOT tick. "
+                        + "Set it to -1 (and restart) if you want them to keep running.");
+            }
+        } catch (IOException | NumberFormatException ignored) {
+            // best-effort check only
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Chunk ticket management (reference-counted, see ticketRefs above)
+    // ------------------------------------------------------------------
+
+    /**
+     * Keeps the stasis chunk and every chunk within chunk-radius of it loaded (and ticking,
+     * as plugin tickets use the same level as /forceload) until releaseTicketArea() is called
+     * for this player. Safe to call repeatedly: re-acquiring the same area is a no-op, and
+     * acquiring a different one first releases the player's previous area.
+     */
+    private void acquireTicketArea(UUID playerId, Location anchor) {
+        World world = anchor.getWorld();
+        if (world == null) return;
+
+        TicketArea area = new TicketArea(world.getUID(), anchor.getBlockX() >> 4, anchor.getBlockZ() >> 4, chunkRadius);
+
+        synchronized (ticketLock) {
+            TicketArea existing = ticketAreas.get(playerId);
+            if (area.equals(existing)) return;
+            if (existing != null) {
+                releaseAreaLocked(existing);
+            }
+
+            for (int dx = -area.radius(); dx <= area.radius(); dx++) {
+                for (int dz = -area.radius(); dz <= area.radius(); dz++) {
+                    ChunkPos pos = new ChunkPos(area.world(), area.centerX() + dx, area.centerZ() + dz);
+                    if (ticketRefs.merge(pos, 1, Integer::sum) == 1) {
+                        world.addPluginChunkTicket(pos.x(), pos.z(), this);
+                    }
+                }
+            }
+            ticketAreas.put(playerId, area);
+        }
+    }
+
+    private void releaseTicketArea(UUID playerId) {
+        synchronized (ticketLock) {
+            TicketArea area = ticketAreas.remove(playerId);
+            if (area != null) {
+                releaseAreaLocked(area);
+            }
+        }
+    }
+
+    private void releaseAllTicketAreas() {
+        synchronized (ticketLock) {
+            for (UUID playerId : new ArrayList<>(ticketAreas.keySet())) {
+                try {
+                    releaseTicketArea(playerId);
+                } catch (RuntimeException e) {
+                    getLogger().warning("Could not release chunk tickets for " + playerId + ": " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    // Caller must hold ticketLock.
+    private void releaseAreaLocked(TicketArea area) {
+        World world = Bukkit.getWorld(area.world());
+        for (int dx = -area.radius(); dx <= area.radius(); dx++) {
+            for (int dz = -area.radius(); dz <= area.radius(); dz++) {
+                ChunkPos pos = new ChunkPos(area.world(), area.centerX() + dx, area.centerZ() + dz);
+                Integer count = ticketRefs.get(pos);
+                if (count == null) continue;
+                if (count <= 1) {
+                    ticketRefs.remove(pos);
+                    if (world != null) {
+                        world.removePluginChunkTicket(pos.x(), pos.z(), this);
+                    }
+                } else {
+                    ticketRefs.put(pos, count - 1);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -157,22 +376,25 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
         double z = dataConfig.getDouble(playerIdStr + ".z");
         Location anchorLoc = new Location(world, x, y, z);
 
+        // Re-establish the chunk tickets for the whole area right away (they live in memory
+        // only, so they're gone after every restart).
+        acquireTicketArea(playerId, anchorLoc);
+
         // Request the chunk to load. If the dummy entity survived (it's marked persistent),
         // ChunkLoadEvent below will find it and resume monitoring automatically. As a
         // fallback - in case the entity didn't survive for whatever reason - we check a
         // few ticks later and respawn it from the saved coordinates if still missing.
-        world.getChunkAtAsync(anchorLoc.getBlockX() >> 4, anchorLoc.getBlockZ() >> 4, true).thenAccept(chunk ->
+        world.getChunkAtAsync(anchorLoc.getBlockX() >> 4, anchorLoc.getBlockZ() >> 4, true).thenAccept(ignored ->
                 Bukkit.getRegionScheduler().runDelayed(this, anchorLoc, (task) -> {
                     if (activeStasis.containsKey(playerId)) {
                         return; // ChunkLoadEvent already reattached it
                     }
                     getLogger().info("Stasis entity for " + playerId + " wasn't found on disk, respawning from saved coordinates.");
-                    chunk.addPluginChunkTicket(this);
                     Bukkit.getRegionScheduler().execute(this, anchorLoc, () -> {
                         Item dummy = world.dropItem(anchorLoc, new ItemStack(Material.ENDER_PEARL));
                         configureDummy(dummy, playerId);
                         activeStasis.put(playerId, dummy);
-                        monitorStasisTrigger(playerId, dummy, chunk, anchorLoc);
+                        monitorStasisTrigger(playerId, dummy, anchorLoc);
                         pinDummyInPlace(dummy, anchorLoc);
                     });
                 }, 5L)
@@ -197,8 +419,6 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
 
             if (activeStasis.containsKey(ownerId)) continue; // already being monitored
 
-            Chunk chunk = event.getChunk();
-            chunk.addPluginChunkTicket(this);
             activeStasis.put(ownerId, dummy);
 
             // Prefer the saved anchor coordinates over the entity's current position -
@@ -209,7 +429,8 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
                 anchorLoc = dummy.getLocation();
             }
 
-            monitorStasisTrigger(ownerId, dummy, chunk, anchorLoc);
+            acquireTicketArea(ownerId, anchorLoc);
+            monitorStasisTrigger(ownerId, dummy, anchorLoc);
             pinDummyInPlace(dummy, anchorLoc);
         }
     }
@@ -265,15 +486,24 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
         if (!(event.getEntity() instanceof EnderPearl pearl)) return;
         if (!(pearl.getShooter() instanceof Player player)) return;
 
-        // Only arm once the pearl has actually entered a recognized stasis medium - this
-        // is what tells us "this is a stasis chamber throw", not just an ordinary pearl
-        // arcing through open air. Two mediums are recognized:
-        //  - water / a bubble column (the Overworld-style chamber)
-        //  - a honey block shaft (the Nether-style chamber, since water evaporates there)
+        // Only arm once the pearl has actually been held by a recognized stasis medium for
+        // a few consecutive ticks - that is what tells us "this is a stasis chamber
+        // throw", not just an ordinary pearl that splashed into a lake or grazed a block.
+        // See requiredMediumTicks() for what counts:
+        //  - an UPWARD bubble column (soul sand) - the Overworld-style chamber. Plain
+        //    water doesn't count: a pearl in still water just sinks and lands.
+        //  - a honey block (or a block from detection.extra-blocks) the pearl is touching,
+        //    e.g. the Nether-style chamber where water evaporates.
         final AtomicBoolean armed = new AtomicBoolean(false);
+        final int[] dwell = {0};
         final double[] lastY = {Double.NEGATIVE_INFINITY};
         final Location[] peak = {null};
+        // Last place the pearl was inside the chamber's water/bubble column. Used to anchor
+        // an UNCAPPED chamber's dummy at the water surface instead of at the top of the
+        // arc, because the column launches the pearl several blocks above the water.
+        final Location[] surface = {null};
         final int[] fallTicks = {0};
+
 
         pearl.getScheduler().runAtFixedRate(this, (task) -> {
             if (!pearl.isValid()) {
@@ -285,11 +515,21 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
             Location loc = pearl.getLocation();
 
             if (!armed.get()) {
-                if (isFluidColumn(loc.getBlock()) || isTouchingHoney(loc.getBlock())) {
+                // Count CONSECUTIVE ticks in a medium; leaving it resets the count, so a
+                // pearl that only clips a medium on its way past is never armed (and
+                // vanilla's normal teleport-on-hit is left completely alone for it).
+                int required = requiredMediumTicks(loc.getBlock());
+                if (required < 0) {
+                    dwell[0] = 0;
+                    return;
+                }
+                dwell[0]++;
+                if (dwell[0] >= required) {
                     armed.set(true);
                     incrementArmed(player.getUniqueId());
                     lastY[0] = loc.getY();
                     peak[0] = loc.clone();
+                    if (isFluidColumn(loc.getBlock())) surface[0] = loc.clone();
                 }
                 return;
             }
@@ -310,6 +550,7 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
             // the pearl actually turning around. This is what stops the "locks a block
             // below the real top" bug.
             boolean stillSubmerged = isFluidColumn(loc.getBlock());
+            if (stillSubmerged) surface[0] = loc.clone();
 
             // Small tolerance so tiny per-tick jitter isn't mistaken for descent.
             if (stillSubmerged || loc.getY() >= lastY[0] - 0.02) {
@@ -329,9 +570,13 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
                 return;
             }
 
-            // It's now clearly and consistently falling - that's the top of the
-            // (uncapped) arc. Lock it in.
-            createStasisDummy(player, pearl, peak[0]);
+            // It's now clearly and consistently falling, so it has been launched out of the
+            // column and is on its way back down. If it came out of water, park the dummy
+            // at the top of that water (between water and air) rather than at the peak of
+            // the arc, which the bubbles' acceleration puts well above the surface. With
+            // no water involved (e.g. a honey chamber) the peak is still what we use.
+            Location lockAt = surface[0] != null ? topOfFluidColumn(surface[0]) : peak[0];
+            createStasisDummy(player, pearl, lockAt);
             task.cancel();
         }, null, 1L, 1L);
     }
@@ -365,8 +610,10 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
     }
 
     /**
-     * True for water and bubble-column blocks - the fluid medium used by Overworld-style
-     * stasis chambers.
+     * True for water and bubble-column blocks. Only used AFTER a pearl is already armed
+     * (i.e. confirmed to be in a real chamber), to tell "still in the chamber's water"
+     * from "has left it" - it is deliberately NOT used to decide whether to arm, since
+     * plain water is not a stasis medium.
      */
     private boolean isFluidColumn(Block block) {
         Material type = block.getType();
@@ -374,15 +621,52 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
     }
 
     /**
-     * True if the given block, or one of its horizontal neighbors, is a honey block.
-     * Honey doesn't need to be entered/passed through to affect an entity - sliding down
-     * alongside its face is what applies the heavy drag - so neighbors count too. This is
-     * the medium used by Nether-style stasis chambers, where water simply evaporates.
+     * Walks up from a point inside a water/bubble column to the topmost water block of
+     * that column - the one whose surface is the boundary between water and air.
      */
-    private boolean isTouchingHoney(Block block) {
-        if (block.getType() == Material.HONEY_BLOCK) return true;
+    private Location topOfFluidColumn(Location from) {
+        Block block = from.getBlock();
+        for (int i = 0; i < 64 && isFluidColumn(block.getRelative(BlockFace.UP)); i++) {
+            block = block.getRelative(BlockFace.UP);
+        }
+        return block.getLocation();
+    }
+
+    /**
+     * If the pearl at this block is being held by a stasis medium, returns how many
+     * consecutive ticks that must last before we treat it as a stasis; otherwise -1.
+     */
+    private int requiredMediumTicks(Block block) {
+        int required = Integer.MAX_VALUE;
+        if (detectBubbleColumns && isUpwardBubbleColumn(block)) {
+            required = minTicksBubbleColumn;
+        }
+        if (!touchMediums.isEmpty() && isTouchingMedium(block)) {
+            required = Math.min(required, minTicksTouchMedium);
+        }
+        return required == Integer.MAX_VALUE ? -1 : required;
+    }
+
+    /**
+     * True only for an UPWARD bubble column (soul sand underneath), which is what holds a
+     * pearl up. Downward columns (magma) push pearls into the floor, and plain water does
+     * nothing, so neither is a stasis.
+     */
+    private boolean isUpwardBubbleColumn(Block block) {
+        if (block.getType() != Material.BUBBLE_COLUMN) return false;
+        return !(block.getBlockData() instanceof BubbleColumn column) || !column.isDrag();
+    }
+
+    /**
+     * True if the given block, or one of its horizontal neighbors, is one of the touch
+     * mediums (honey by default). Honey doesn't need to be entered/passed through to
+     * affect an entity - sliding down alongside its face is what applies the heavy
+     * drag - so neighbors count too.
+     */
+    private boolean isTouchingMedium(Block block) {
+        if (touchMediums.contains(block.getType())) return true;
         for (BlockFace face : new BlockFace[]{BlockFace.NORTH, BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST}) {
-            if (block.getRelative(face).getType() == Material.HONEY_BLOCK) return true;
+            if (touchMediums.contains(block.getRelative(face).getType())) return true;
         }
         return false;
     }
@@ -392,13 +676,15 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
         // doubles as the exact spawn point for the visible item.
         Location anchorLoc = peakLoc.clone();
         anchorLoc.setX(anchorLoc.getBlockX() + 0.5);
-        anchorLoc.setY(anchorLoc.getBlockY() + 0.9);
+        anchorLoc.setY(anchorLoc.getBlockY() + dummyHeight);
         anchorLoc.setZ(anchorLoc.getBlockZ() + 0.5);
 
-        Chunk chunk = anchorLoc.getChunk();
-        chunk.addPluginChunkTicket(this);
-
         UUID playerId = player.getUniqueId();
+
+        // Keep the stasis chunk (and chunk-radius chunks around it) loaded. This uses
+        // World#addPluginChunkTicket by coordinates, so it doesn't force a synchronous
+        // chunk load on this thread the way Location#getChunk() would.
+        acquireTicketArea(playerId, anchorLoc);
 
         Bukkit.getRegionScheduler().execute(this, anchorLoc, () -> {
             Item dummy = anchorLoc.getWorld().dropItem(anchorLoc, new ItemStack(Material.ENDER_PEARL));
@@ -416,7 +702,7 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
             // exact cause of the duplicate-pearl bug.
             decrementArmed(playerId);
 
-            monitorStasisTrigger(playerId, dummy, chunk, anchorLoc);
+            monitorStasisTrigger(playerId, dummy, anchorLoc);
             pinDummyInPlace(dummy, anchorLoc);
         });
     }
@@ -490,11 +776,10 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
         }
 
         Location destination = dummy.getLocation();
-        Chunk chunk = destination.getChunk();
 
         triggerTeleport(ownerId, destination);
         dummy.remove();
-        cleanUp(ownerId, chunk);
+        cleanUp(ownerId);
     }
 
     // ------------------------------------------------------------------
@@ -502,7 +787,7 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
     // (e.g. someone toggling a trapdoor via redstone) to know when to teleport back.
     // ------------------------------------------------------------------
 
-    private void monitorStasisTrigger(UUID playerId, Entity dummy, Chunk chunk, Location anchorLoc) {
+    private void monitorStasisTrigger(UUID playerId, Entity dummy, Location anchorLoc) {
         Block center = anchorLoc.getBlock();
 
         // Stretch the hitbox slightly upward (Y + 0.8) to act as a collision "antenna"
@@ -527,7 +812,7 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
 
         Bukkit.getRegionScheduler().runAtFixedRate(this, anchorLoc, (task) -> {
             if (!dummy.isValid()) {
-                cleanUp(playerId, chunk);
+                cleanUp(playerId);
                 task.cancel();
                 return;
             }
@@ -559,7 +844,7 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
             if (newCollisionDetected) {
                 triggerTeleport(playerId, anchorLoc);
                 dummy.remove();
-                cleanUp(playerId, chunk);
+                cleanUp(playerId);
                 task.cancel();
             }
         }, 10L, 2L);
@@ -580,9 +865,9 @@ public class PearlStasisFix extends JavaPlugin implements Listener {
         }
     }
 
-    private void cleanUp(UUID playerId, Chunk chunk) {
+    private void cleanUp(UUID playerId) {
         activeStasis.remove(playerId);
-        chunk.removePluginChunkTicket(this);
+        releaseTicketArea(playerId);
         removeStasisRecord(playerId);
     }
 }

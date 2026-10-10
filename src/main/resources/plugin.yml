@@ -1,7 +1,16 @@
 name: PearlStasisFix
-version: '1.4.0'
+version: '1.5.0'
 main: dev.xeaf.pearlstasisfix.PearlStasisFix
 # Setting this to 1.20 ensures it loads on 1.20, 1.21, and 26.x
 api-version: '1.20'
 folia-supported: true
 description: Re-implements ender pearl stasis chambers for Folia via dummy entities.
+commands:
+  pearlstasisfix:
+    description: PearlStasisFix admin command
+    usage: /pearlstasisfix reload
+    permission: pearlstasisfix.admin
+permissions:
+  pearlstasisfix.admin:
+    description: Allows /pearlstasisfix reload
+    default: op

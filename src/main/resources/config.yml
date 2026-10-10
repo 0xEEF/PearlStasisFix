@@ -1,0 +1,53 @@
+# PearlStasisFix configuration
+
+# How many chunks to keep loaded around each stasis chamber, in every direction,
+# for as long as its pearl is in stasis.
+#
+#   0 = only the chunk the pearl is in
+#   1 = 3x3 chunks (default)
+#   2 = 5x5 chunks
+#   3 = 7x7 chunks ... and so on
+#
+# These are Paper "plugin chunk tickets" - the same kind of load as /forceload, so the
+# chunks keep ticking (redstone, crops, hoppers, ...) even with nobody nearby.
+# Every chunk in the area costs server performance, and the cost grows with the square
+# of the radius, so keep this as low as you can get away with. Maximum: 8.
+#
+# Note: ticking chunks are not the same as active mob spawners / mob farms. Vanilla
+# only activates a spawner (or spawns mobs) when a PLAYER is within range of it.
+#
+# Applied when the plugin starts or when a pearl enters stasis - changing it needs a
+# server restart, and stasis chambers already loaded keep the radius they started with.
+chunk-radius: 1
+
+# How high above the floor of its water block the parked pearl sits, from 0.0 to 0.99.
+# The water surface is at about 0.89, so the default puts the pearl right on the waterline.
+# To nudge it, change it in steps of 0.01 (lower = pearl sits deeper in the water).
+# Only affects pearls that enter stasis AFTER the change - an existing stasis pearl keeps
+# the height it was created at, so retrieve it and throw it again.
+dummy-height: 0.87
+
+# ----------------------------------------------------------------------------
+# Stasis detection
+# ----------------------------------------------------------------------------
+# A thrown pearl is only turned into a stasis when it is actually HELD by a stasis
+# medium for a few ticks in a row. Plain water is NOT a medium (a pearl in a lake just
+# sinks and lands), and a pearl that only grazes a medium on its way past is ignored,
+# so it teleports you as normal.
+detection:
+  # Upward bubble columns (water above SOUL SAND) - the classic Overworld chamber.
+  # Downward columns (above magma) never count.
+  bubble-columns: true
+
+  # Pearls sliding down the side of a honey block - the Nether-style chamber.
+  honey-blocks: true
+
+  # Any other block a pearl should count as being "held" by when it touches it (same
+  # touching rule as honey: the block the pearl is in, or one right beside it).
+  # Use Bukkit material names, e.g. [SLIME_BLOCK, COBWEB]. Empty by default.
+  extra-blocks: []
+
+  # How many CONSECUTIVE ticks (20 = 1 second) the pearl must be held before it counts.
+  # Raise these if normal throws still get caught; lower them if a chamber isn't detected.
+  min-ticks-bubble-column: 2
+  min-ticks-touch-medium: 10
